@@ -1,0 +1,5 @@
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a medium-wide tracking shot frames a red fox trotting through a sunlit meadow at golden hour, tall grass parting around its legs. The camera trucks right with small amplitude at slow speed, keeping the fox in the lower third of the frame as warm backlight catches its fur. The fox's appearance, fur color, proportions, and gait stay consistent throughout. [Shot 2] At 00:02.500, the camera cuts to a close-up of the fox's forepaws pressing through the dry stems while its tail sweeps behind it, the same warm backlight continuing.
+
+overall_soundscape: Soft wind moves through the tall meadow grass, and dry stems rustle as the fox's paws part them. A distant bird calls twice, and the grass settles as the fox slows near the end.
+
+non_diegetic_music: A sparse acoustic-guitar pattern at a slow tempo, joined by low sustained strings that rise slightly and fade out.

@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# videogen — generate a video with a synchronized soundtrack, locally. Wraps
+# sd-cli (stable-diffusion.cpp) for the MiniMax-H3 recipe and transcodes the
+# result to H.264 + AAC mp4.
+#
+#   videogen "a red fox walks through a sunlit meadow" --seconds 5
+#   videogen "..." --preset quality            # no LoRA, 28 steps
+#   videogen "..." --preset turbo --canvas 1344x768
+#   videogen "..." --profile bf16 --encoder ... --dry-run
+#
+# --preset spends TIME, --profile spends MEMORY:
+#   turbo    larry LoRA at 6 steps, the reference page's default  (fast)
+#   lightx   lightx2v LoRA at 4 steps, the more aggressive adapter
+#   quality  no LoRA at 28 steps, the base model's own trajectory
+#   q8|q6|q4       pruned-AdaLN GGUF ladder (default q8, 19.97 GiB)
+#   base-q4        non-pruned GGUF at Q4_K_M
+#   bf16|int8|pruned-bf16   Comfy-Org safetensors, up to the page's own weights
+#
+# sd-cli writes .webm (VP8) or .avi (MJPEG), never H.264; ffmpeg does the final
+# remux so the clip is a normal mp4, as the reference Space emits.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SD_CLI="${SD_CLI:-$ROOT/bin/sd-cli}"
+SD="${SD:-$ROOT/models/sd}"
+LORA_DIR="${LORA_DIR:-$ROOT/models/loras}"
+OUT_DIR="${OUT_DIR:-$ROOT/out}"
+
+# The profile is resolved to a DiT file AFTER argument parsing, so that
+# --profile and the PROFILE environment variable both work; see resolve_profile.
+PROFILE="${PROFILE:-q8}"
+# Encoder: the GGUF is the standing choice; the safetensors are the
+# higher-fidelity ones republished from the original weights.
+ENCODER="${ENCODER:-qwen3vl_32b_minimax_h3-Q4_K_M.gguf}"
+VIDEO_VAE="${VIDEO_VAE:-minimax_h3_video_vae_fp16.safetensors}"
+AUDIO_VAE="${AUDIO_VAE:-minimax_h3_audio_vae_fp32.safetensors}"
+
+# Defaults chosen for the recipe: 1344x768 (the 768-pixel short edge the
+# checkpoint wants), 5.167 s = 124 frames, the turbo design point, lightx first
+# because it is the more aggressive 4-step set.
+CANVAS="1344x768"
+SECONDS_LEN="5"
+STEPS="6"
+LORA="lightx"
+SEED=""
+INIT=""
+END=""
+CFG="1.0"
+OUT=""
+EXTRA=""
+PROMPT=""
+PROMPT_FILE=""
+DRY=0
+
+snap_frames() { # 17 * n + 5, the only frame counts the H3 video VAE decodes
+  local n="$1"
+  while (( n % 17 != 5 )); do n=$((n + 1)); done
+  printf '%s' "$n"
+}
+
+# The usage text is the leading comment block of this file (line 2 up to the
+# first line that is not a comment), so it cannot drift out of step with it.
+usage() { awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"; }
+
+# The weight ladder: a profile name resolves to the DiT file it selects.
+# Called after argument parsing so that both --profile and PROFILE= work.
+resolve_profile() {
+  case "$PROFILE" in
+    # GGUF ladder, AdaLN curve-table (pruned) builds.
+    q8) DIT="minimax_h3_fl2va_pruned-Q8_0.gguf" ;;
+    q6) DIT="minimax_h3_fl2va_pruned-Q6_K.gguf" ;;
+    q4) DIT="minimax_h3_fl2va_pruned-Q4_K.gguf" ;;
+    # Non-pruned GGUF: removes the AdaLN approximation at Q4.
+    base-q4) DIT="minimax_h3_fl2va-Q4_K_M.gguf" ;;
+    # Safetensors republished from the original weights. The bf16 file is the
+    # reference deployment's own transformer; loading these is not yet verified.
+    bf16) DIT="minimax_h3_fl2va_bf16.safetensors" ;;
+    int8) DIT="minimax_h3_fl2va_int8_convrot.safetensors" ;;
+    pruned-bf16) DIT="minimax_h3_fl2va_pruned_bf16.safetensors" ;;
+    *) echo "unknown profile '$PROFILE' (q8|q6|q4|base-q4|bf16|int8|pruned-bf16)" >&2; exit 2 ;;
+  esac
+}
+
+PRESET=""
+LORA_GIVEN=0
+STEPS_GIVEN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --canvas)  CANVAS="$2"; shift 2 ;;
+    --seconds) SECONDS_LEN="$2"; shift 2 ;;
+    --frames)  FRAMES="$2"; shift 2 ;;
+    --steps)   STEPS="$2"; STEPS_GIVEN=1; shift 2 ;;
+    --lora)    LORA="$2"; LORA_GIVEN=1; shift 2 ;;
+    --preset)  PRESET="$2"; shift 2 ;;
+    --seed)    SEED="$2"; shift 2 ;;
+    --init)    INIT="$2"; shift 2 ;;
+    --end)     END="$2"; shift 2 ;;
+    --cfg)     CFG="$2"; shift 2 ;;
+    --out)     OUT="$2"; shift 2 ;;
+    --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
+    --profile) PROFILE="$2"; shift 2 ;;
+    --encoder) ENCODER="$2"; shift 2 ;;
+    --extra)   EXTRA="$2"; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "unknown option $1" >&2; usage; exit 2 ;;
+    *) PROMPT="$1"; shift ;;
+  esac
+done
+
+# Two ways to spend, and they are independent:
+#   a PRESET spends TIME (sampling steps) with the weights fixed;
+#   a PROFILE spends MEMORY (weight fidelity) with the steps fixed.
+# An explicit --lora or --steps still wins over the preset.
+if [ -n "$PRESET" ]; then
+  case "$PRESET" in
+    turbo)   [ "$LORA_GIVEN" = 1 ] || LORA="larry";  [ "$STEPS_GIVEN" = 1 ] || STEPS=6 ;;
+    lightx)  [ "$LORA_GIVEN" = 1 ] || LORA="lightx"; [ "$STEPS_GIVEN" = 1 ] || STEPS=4 ;;
+    quality) [ "$LORA_GIVEN" = 1 ] || LORA="off";    [ "$STEPS_GIVEN" = 1 ] || STEPS=28 ;;
+    *) echo "unknown preset '$PRESET' (turbo|lightx|quality)" >&2; exit 2 ;;
+  esac
+fi
+
+# Resolve the profile to its DiT file, now that --profile has been parsed.
+resolve_profile
+
+# The official H3 prompt is multi-line and field-structured, so a long prompt
+# comes from a file; the positional form stays for short one-liners.
+if [ -n "$PROMPT_FILE" ]; then
+  [ -f "$PROMPT_FILE" ] || { echo "error: prompt file not found: $PROMPT_FILE" >&2; exit 2; }
+  PROMPT="$(cat "$PROMPT_FILE")"
+fi
+
+[ -n "$PROMPT" ] || { echo "error: a prompt is required" >&2; usage; exit 2; }
+[ -x "$SD_CLI" ] || { echo "error: $SD_CLI not built; run scripts/start-videogen.sh build" >&2; exit 1; }
+for f in "$SD/$DIT" "$SD/$ENCODER" "$SD/$VIDEO_VAE" "$SD/$AUDIO_VAE"; do
+  [ -f "$f" ] || { echo "error: missing $f; run scripts/start-videogen.sh download" >&2; exit 1; }
+done
+
+W="${CANVAS%x*}"; H="${CANVAS#*x}"
+if [ -n "${FRAMES:-}" ]; then N="$FRAMES"; else N=$(snap_frames "$(awk -v s="$SECONDS_LEN" 'BEGIN{printf "%d", s*24}')"); fi
+[ -z "$SEED" ] && SEED=$((RANDOM * 32768 + RANDOM))
+mkdir -p "$OUT_DIR"
+[ -z "$OUT" ] && OUT="$OUT_DIR/h3-$(date +%Y%m%d-%H%M%S)-$SEED.mp4"
+STEM="${OUT%.*}"
+WEBM="$STEM.webm"
+
+LORA_TAG=""
+LORA_NOTE="off"
+if [ "$LORA" != "off" ]; then
+  case "$LORA" in
+    larry)  LORA_FILE="$LORA_DIR/larry_4step_ema_ckpt850.safetensors" ;;
+    lightx) LORA_FILE="$LORA_DIR/lightx_4step_v1.2_768p_comfyui_bf16.safetensors" ;;
+    *)      LORA_FILE="$LORA_DIR/$LORA" ;;
+  esac
+  [ -f "$LORA_FILE" ] || { echo "error: LoRA not found: $LORA_FILE" >&2; exit 1; }
+  LORA_TAG="<lora:$(basename "${LORA_FILE%.safetensors}"):1>"
+  LORA_NOTE="$(basename "$LORA_FILE")"
+fi
+
+ARGS=(-M vid_gen
+      --diffusion-model "$SD/$DIT"
+      --vae "$SD/$VIDEO_VAE"
+      --audio-vae "$SD/$AUDIO_VAE"
+      --llm "$SD/$ENCODER"
+      --lora-model-dir "$LORA_DIR"
+      -p "${PROMPT}${LORA_TAG}"
+      -W "$W" -H "$H" --video-frames "$N" --fps 24
+      --steps "$STEPS"
+      --cfg-scale "$CFG" --seed "$SEED" --rng cpu
+      --diffusion-fa
+      -o "$WEBM" -v)
+[ -n "$INIT" ] && ARGS+=(-i "$INIT")
+[ -n "$END" ]  && ARGS+=(--end-img "$END")
+[ -n "$EXTRA" ] && ARGS+=($EXTRA)
+
+echo "videogen: preset=${PRESET:-custom} canvas=$CANVAS ${N}f ($(awk -v n="$N" 'BEGIN{printf "%.3f", n/24}')s) steps=$STEPS lora=$LORA_NOTE profile=$PROFILE seed=$SEED"
+if [ "$DRY" = 1 ]; then
+  printf 'dry-run:'; printf ' %q' "$SD_CLI" "${ARGS[@]}"; printf '\n'
+  exit 0
+fi
+
+START=$(date +%s)
+"$SD_CLI" "${ARGS[@]}"
+GEN=$(( $(date +%s) - START ))
+
+[ -f "$WEBM" ] || { echo "error: sd-cli produced no $WEBM" >&2; exit 1; }
+if command -v ffmpeg >/dev/null; then
+  ffmpeg -y -loglevel error -i "$WEBM" -c:v libx264 -preset medium -crf 18 \
+         -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart "$OUT"
+  rm -f "$WEBM"
+else
+  OUT="$WEBM"
+  echo "warning: ffmpeg missing; leaving the VP8 .webm in place" >&2
+fi
+
+REPORT="$STEM.json"
+printf '{"prompt":"%s","preset":"%s","profile":"%s","canvas":"%s","frames":%s,"fps":24,"steps":%s,"lora":"%s","seed":%s,"cfg":%s,"seconds":%s,"output":"%s","dit":"%s","encoder":"%s"}\n' \
+  "$(printf '%s' "$PROMPT" | sed 's/\\/\\\\/g; s/"/\\"/g')" "${PRESET:-custom}" "$PROFILE" "$CANVAS" "$N" "$STEPS" "$LORA_NOTE" \
+  "$SEED" "$CFG" "$GEN" "$OUT" "$DIT" "$ENCODER" > "$REPORT"
+
+echo "videogen: wrote $OUT in ${GEN}s"
+echo "$OUT"

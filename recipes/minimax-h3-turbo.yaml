@@ -1,0 +1,216 @@
+# Recipe contract — MiniMax-H3 Turbo, video with a synchronized soundtrack
+#
+# One entry per model: the exact artifact list, the launcher, and the evidence
+# behind each setting. Facts that are not measured yet are marked unverified;
+# do not promote them to verified without a run.
+
+recipe: minimax-h3-turbo
+revision: 1
+date: 2026-10-11
+status: >-
+  partially verified. Clips rendered at 960x544; the native 1344x768 canvas and
+  the artifact A/B are unmeasured. See evidence below.
+
+reference:
+  # The deployment this recipe reproduces.
+  space: Pepe104/MiniMax-H3-Turbo-Lora-UNCENSORED
+  space_revision: f5e402f0bcad6f86258d7ccfac3899c59f8f0e8c
+  what_it_is: >-
+    The denoising half of a split diffusers deployment: MiniMax-H3 FL2VA with
+    two 4-step turbo LoRAs folded into bf16 weights, AoTI-compiled blocks, and
+    the Qwen3-VL-32B conditioner running in a second Space.
+
+model:
+  name: MiniMax-H3 (Hailuo 3.0)
+  architecture: 33B dense single-stream omni-modal diffusion transformer
+  outputs: video plus 32 kHz stereo audio in one denoising pass
+  spec:
+    fps: 24
+    short_edge_px: 768
+    duration_s: 4-15
+    frame_grid: "17 * n + 5"
+    cfg: guidance-distilled, so no negative prompt and cfg 1.0
+
+hardware:
+  # The host this was measured on. The binding constraint is the memory budget,
+  # not the part number: any arm64 or x86_64 machine with a CUDA-capable
+  # accelerator and enough unified memory (or host plus device memory) runs the
+  # same recipe.
+  target: arm64 host, about 128 GiB unified memory
+  compute_capability: "12.1"   # the reference build's value; set CUDA_ARCH for your GPU
+  arch: aarch64
+  unified_memory_gib: 121.6
+  usable_pool_gib: 119.68
+
+runner:
+  name: stable-diffusion.cpp
+  why: >-
+    Pure C/C++ on ggml: no ComfyUI and no Python service. Day-1 MiniMax-H3
+    support, and it loads the reference (Comfy) key tree that the turbo LoRAs
+    target.
+  repo: https://github.com/leejet/stable-diffusion.cpp
+  submodule_note: ggml is a git submodule (leejet/ggml); clone must be recursive
+  build:
+    command: >-
+      cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+      -DCMAKE_CUDA_ARCHITECTURES=121 -DSD_CUDA=ON
+      && cmake --build build --config Release -j
+    arch_flag: >-
+      CMAKE_CUDA_ARCHITECTURES comes from CUDA_ARCH (default 121, the reference
+      build's value); set it to your GPU's compute capability.
+
+artifacts:
+  # Standing profile. Sizes are exact byte counts from the Hugging Face tree
+  # API, re-verified against the live repositories at publication.
+  - role: dit
+    repo: unsloth/MiniMax-H3-GGUF
+    revision: d629413c2e5b51b38c453668b75ca3b06ca92703
+    file: minimax_h3_fl2va_pruned-Q8_0.gguf
+    bytes: 21437786208
+    note: pruned AdaLN curve-table build, FL2VA partition
+  - role: text_encoder
+    repo: unsloth/MiniMax-H3-GGUF
+    revision: d629413c2e5b51b38c453668b75ca3b06ca92703
+    file: qwen3vl_32b_minimax_h3-Q4_K_M.gguf
+    bytes: 18218065024
+    note: Qwen3-VL-32B truncated to 50 language layers, vision tower retained
+  - role: video_vae
+    repo: unsloth/MiniMax-H3-GGUF
+    revision: d629413c2e5b51b38c453668b75ca3b06ca92703
+    file: vae/minimax_h3_video_vae_fp16.safetensors
+    bytes: 5207808496
+  - role: audio_vae
+    repo: unsloth/MiniMax-H3-GGUF
+    revision: d629413c2e5b51b38c453668b75ca3b06ca92703
+    file: vae/minimax_h3_audio_vae_fp32.safetensors
+    bytes: 605254808
+    note: fp32 on purpose; a bf16 audio VAE decodes about 20 dB too quiet
+  - role: lora
+    repo: larryvrh/MiniMax-H3-Turbo-Lora
+    revision: 43a74557ac3f6539db8e0f2a959d03feb7a81480
+    file: minimax_h3_turbo_4step_ema_ckpt850.safetensors
+    bytes: 779849816
+    note: >-
+      the reference deployment's default; base_model Comfy-Org/MiniMax-H3. The
+      same repository also carries minimax_h3_turbo_v4_step600_ema.safetensors
+      (779,849,816 bytes), which its author now recommends over the v1 ckpt850
+      line.
+  - role: lora
+    repo: lightx2v/Minimax-h3-Turbo
+    revision: 3ec17a324ced54151364f24f8b5fb6bf7e26414f
+    file: minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
+    bytes: 1956193000
+
+# Totals for the artifact list above.
+artifacts_total_bytes: 48204957352
+artifacts_total_gib: 44.90
+artifacts_total_gb: 48.20
+
+launch:
+  # The LoRA is applied through the prompt, per stable-diffusion.cpp's design.
+  template: >-
+    sd-cli -M vid_gen
+    --diffusion-model models/sd/<DIT>
+    --vae models/sd/minimax_h3_video_vae_fp16.safetensors
+    --audio-vae models/sd/minimax_h3_audio_vae_fp32.safetensors
+    --llm models/sd/<ENCODER>
+    --lora-model-dir models/loras
+    -p "<PROMPT><lora:<LORA>:1>"
+    -W 1344 -H 768 --video-frames 124 --fps 24
+    --cfg-scale 1.0 --seed <SEED> --rng cpu --diffusion-fa
+    -o out/<NAME>.webm -v
+  wrapper: bin/videogen
+  post_process: >-
+    sd-cli writes VP8 .webm or MJPEG .avi, never H.264; the wrapper transcodes
+    to H.264 plus AAC mp4 with ffmpeg, matching what the reference deployment
+    emits.
+  defaults:
+    canvas: 1344x768
+    frames: 124          # 5.167 s
+    steps: 6
+    lora: lightx
+    cfg: 1.0
+
+shapes:
+  - name: quality
+    dit: minimax_h3_fl2va_pruned-Q8_0.gguf
+    dit_gib: 19.97
+    weight_total_gib: 42.4
+    note: standing profile
+  - name: balanced
+    dit: minimax_h3_fl2va_pruned-Q6_K.gguf
+    dit_gib: 15.45
+    weight_total_gib: 37.8
+  - name: fast
+    dit: minimax_h3_fl2va_pruned-Q4_K.gguf
+    dit_gib: 10.64
+    weight_total_gib: 28.3
+  - name: lora-parity
+    dit: minimax_h3_fl2va-Q4_K_M.gguf
+    dit_gib: 17.49
+    note: non-pruned, for the pruned-against-non-pruned and LoRA-key A/B
+
+evidence:
+  measured:
+    - >-
+      The unquantized reference does not fit one host: 62.15 GiB conditioner
+      plus 72.16 GiB denoiser (61.73 bf16 transformer plus 10.43 of fp32
+      autoencoders) against a 119.68 GiB usable pool. Read from the reference
+      deployment's own README and source; the split exists precisely because a
+      single hosted allocation will not hold it.
+    - >-
+      A first clip rendered end to end: 960x544, 73 frames (3.042 s), 20
+      sampling steps, larry LoRA applied, Q8_0 pruned DiT, binding confirmed by
+      "apply_loras completed" in sd-cli's output. Generation took 648 s as the
+      wrapper's report records it. Peak footprint released afterwards: 41,655
+      MB, matching the observed 43 GB resident. Output h264 960x544 at 24 fps
+      plus AAC 32 kHz stereo, 1,749,395 bytes.
+    - >-
+      A second clip with the turbo preset: 960x544, 73 frames, 6 steps, larry
+      LoRA, 253 s. The run's report is in docs/media/ab-turbo-6.json.
+    - >-
+      Soundtrack level, measured with ffmpeg's volumedetect over 196,608
+      samples at the same shape and seed: the prose-prompt run at mean -57.6 dB
+      and peak -33.9 dB, the field-structured prompt at mean -44.6 dB and peak
+      -32.4 dB. Writing overall_soundscape explicitly is what moves it.
+    - >-
+      Every artifact downloaded byte-exact against this manifest: DiT
+      21,437,786,208; encoder 18,218,065,024; video VAE 5,207,808,496; audio VAE
+      605,254,808; larry 779,849,816; lightx 1,956,193,000.
+  open_questions_from_the_first_run:
+    - >-
+      The low audio level of that run (mean -57.6 dB, peak -33.9 dB) is
+      explained by the request rather than the decode path: it used a prose
+      prompt with the audio asked for inline. Closed by the field-structured
+      follow-up, which measures mean -44.6 dB. See measured above.
+    - >-
+      That run applied the turbo LoRA at 20 steps, which is outside the
+      adapter's design range: past about 8 steps a distilled LoRA stops helping
+      and can introduce over-sharp artifacts. It is not a valid quality sample
+      for either mode, which is why the comparison runs exist.
+  unverified_and_required:
+    - end-to-end wall time at the native 1344x768 canvas
+    - peak memory of a real native-canvas request
+    - >-
+      measured difference between turbo (6 steps, LoRA) and quality (28 steps,
+      no LoRA) on identical prompt and seed
+    - >-
+      whether the pruned DiT and the larry LoRA agree key for key, beyond the
+      absence of an error (see docs/DESIGN.md)
+    - >-
+      whether sd.cpp loads the safetensors republished from the original
+      weights (the bf16, int8 and pruned-bf16 profiles)
+
+memory:
+  note: >-
+    A run holds the whole standing profile resident (44.90 GiB) plus the
+    sampler's working set, which grows with the canvas. Plan for roughly 64 GB,
+    and if the host is shared with another large model, size that one first so
+    a video job cannot push it into an out-of-memory kill.
+
+license:
+  this_repo: MIT
+  weights: MiniMax H3 Community License Agreement (license:other)
+  larry_lora: Apache-2.0
+  lightx_lora: Apache-2.0

@@ -1,0 +1,23 @@
+# weights, adapters and generated outputs never enter the repo
+models/sd/
+models/loras/
+models/.dl/
+models/SHA256SUMS
+out/
+inputs/
+bin/sd-cli
+
+# runner source checkout
+.src/
+.src-*/
+
+# local index and tool artifacts (regenerable build output)
+.rag-index/
+.callgraph-index.bin
+graphify-out/
+graphify-rs-out/
+.cache/
+*.part
+
+# the session handoff is machine-local working state, never published
+videogen-handoff.md
